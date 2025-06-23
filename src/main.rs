@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 const STREAMING_SOURCE_IP: &str = "34.127.57.0";   // GCP streaming service IP
 const STREAMING_SOURCE_PORT: u16 = 8888;           // GCP streaming service port
 
+// ============================================
+// SIGNAL OUTPUT UDP CONFIGURATION
+// ============================================
+const SIGNAL_OUTPUT_PORT: u16 = 9999;              // Port to stream signals on
+const SIGNAL_OUTPUT_BIND_IP: &str = "0.0.0.0";     // IP to bind signal output to
+
 // Configuration for the trading strategy
 #[derive(Clone, Debug)]
 pub struct StrategyConfig {
@@ -52,6 +58,7 @@ pub struct MarketData {
 
 // Trading signal output
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "PascalCase")]
 pub enum Signal {
     Buy {
         symbol: String,
@@ -68,7 +75,6 @@ pub enum Signal {
         mid_price: f64,
     },
 }
-
 // Order book imbalance metrics
 #[derive(Debug, Clone)]
 struct ImbalanceMetrics {
@@ -358,37 +364,195 @@ impl UdpMarketDataConsumer {
     }
 }
 
-// Signal output handler
-pub struct SignalOutput {
-    receiver: crossbeam_channel::Receiver<Signal>,
+// NEW: UDP Signal Broadcaster - streams signals to UDP clients
+pub struct UdpSignalBroadcaster {
+    socket: Arc<UdpSocket>,
+    clients: Arc<Mutex<Vec<SocketAddr>>>,
 }
 
-impl SignalOutput {
-    pub fn new(receiver: crossbeam_channel::Receiver<Signal>) -> Self {
-        Self { receiver }
+impl UdpSignalBroadcaster {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let bind_addr = format!("{}:{}", SIGNAL_OUTPUT_BIND_IP, SIGNAL_OUTPUT_PORT);
+        let socket = UdpSocket::bind(&bind_addr)?;
+        
+        println!("🎯 Signal UDP broadcaster bound to: {}", bind_addr);
+        println!("📡 Clients can connect by sending any message to this address");
+        
+        // Set non-blocking for client registration checks
+        socket.set_nonblocking(true)?;
+        
+        Ok(Self {
+            socket: Arc::new(socket),
+            clients: Arc::new(Mutex::new(Vec::new())),
+        })
     }
-
-    pub fn start_output_stream(&self) {
-        thread::spawn({
-            let receiver = self.receiver.clone();
-            move || {
-                println!("📊 Signal output thread started");
-                loop {
-                    match receiver.recv() {
-                        Ok(signal) => {
-                            match serde_json::to_string(&signal) {
-                                Ok(json) => println!("🚨 SIGNAL: {}", json),
-                                Err(e) => eprintln!("❌ Failed to serialize signal: {}", e),
+    
+    pub fn start_client_listener(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let socket_clone = self.socket.clone();
+        let clients_clone = self.clients.clone();
+        
+        thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            println!("👂 Client registration listener started");
+            
+            loop {
+                match socket_clone.recv_from(&mut buffer) {
+                    Ok((size, addr)) => {
+                        let message = String::from_utf8_lossy(&buffer[..size]);
+                        println!("📞 Client registration from {}: {}", addr, message.trim());
+                        
+                        if let Ok(mut clients) = clients_clone.lock() {
+                            if !clients.contains(&addr) {
+                                clients.push(addr);
+                                println!("✅ Added client: {} (total: {})", addr, clients.len());
+                                
+                                // Send acknowledgment
+                                let ack = "CONNECTED";
+                                let _ = socket_clone.send_to(ack.as_bytes(), addr);
                             }
                         }
-                        Err(_) => {
-                            println!("📊 Signal output thread: Channel closed");
-                            break;
-                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No data available, continue
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Client listener error: {}", e);
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
             }
         });
+        
+        Ok(())
+    }
+    
+    pub fn broadcast_signal(&self, signal: &Signal) -> Result<(), Box<dyn std::error::Error>> {
+        let json_signal = serde_json::to_string(signal)?;
+        
+        if let Ok(mut clients) = self.clients.lock() {
+            if clients.is_empty() {
+                // Still log to console if no UDP clients
+                println!("🚨 SIGNAL (no UDP clients): {}", json_signal);
+                return Ok(());
+            }
+            
+            println!("📡 Broadcasting signal to {} clients: {}", clients.len(), json_signal);
+            
+            let mut failed_clients = Vec::new();
+            
+            for (i, &client_addr) in clients.iter().enumerate() {
+                match self.socket.send_to(json_signal.as_bytes(), client_addr) {
+                    Ok(_) => {
+                        println!("  ✅ Sent to client {}: {}", i + 1, client_addr);
+                    }
+                    Err(e) => {
+                        println!("  ❌ Failed to send to {}: {}", client_addr, e);
+                        failed_clients.push(client_addr);
+                    }
+                }
+            }
+            
+            // Remove failed clients (they may have disconnected)
+            for failed_addr in failed_clients {
+                clients.retain(|&addr| addr != failed_addr);
+                println!("🗑️  Removed disconnected client: {}", failed_addr);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    pub fn get_client_count(&self) -> usize {
+        self.clients.lock().map(|c| c.len()).unwrap_or(0)
+    }
+}
+
+// UPDATED: Signal output handler with UDP broadcasting
+pub struct SignalOutput {
+    receiver: crossbeam_channel::Receiver<Signal>,
+    udp_broadcaster: UdpSignalBroadcaster,
+}
+
+impl SignalOutput {
+    pub fn new(receiver: crossbeam_channel::Receiver<Signal>) -> Result<Self, Box<dyn std::error::Error>> {
+        let udp_broadcaster = UdpSignalBroadcaster::new()?;
+        
+        Ok(Self { 
+            receiver,
+            udp_broadcaster,
+        })
+    }
+
+    pub fn start_output_stream(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Start client listener
+        self.udp_broadcaster.start_client_listener()?;
+        
+        // Start signal broadcasting thread
+        let receiver = self.receiver.clone();
+        let broadcaster = &self.udp_broadcaster;
+        
+        // We need to clone the broadcaster for the thread
+        let socket = broadcaster.socket.clone();
+        let clients = broadcaster.clients.clone();
+        
+        thread::spawn(move || {
+            println!("📊 Signal output thread started");
+            loop {
+                match receiver.recv() {
+                    Ok(signal) => {
+                        // Serialize signal to JSON
+                        match serde_json::to_string(&signal) {
+                            Ok(json_signal) => {
+                                // Broadcast via UDP
+                                if let Ok(mut client_list) = clients.lock() {
+                                    if client_list.is_empty() {
+                                        // Still log to console if no UDP clients
+                                        println!("🚨 SIGNAL (no UDP clients): {}", json_signal);
+                                    } else {
+                                        println!("📡 Broadcasting signal to {} clients: {}", client_list.len(), json_signal);
+                                        
+                                        let mut failed_clients = Vec::new();
+                                        
+                                        for (i, &client_addr) in client_list.iter().enumerate() {
+                                            match socket.send_to(json_signal.as_bytes(), client_addr) {
+                                                Ok(_) => {
+                                                    println!("  ✅ Sent to client {}: {}", i + 1, client_addr);
+                                                }
+                                                Err(e) => {
+                                                    println!("  ❌ Failed to send to {}: {}", client_addr, e);
+                                                    failed_clients.push(client_addr);
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Remove failed clients
+                                        for failed_addr in failed_clients {
+                                            client_list.retain(|&addr| addr != failed_addr);
+                                            println!("🗑️  Removed disconnected client: {}", failed_addr);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to serialize signal: {}", e);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        println!("📊 Signal output thread: Channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+        
+        Ok(())
+    }
+    
+    pub fn get_client_count(&self) -> usize {
+        self.udp_broadcaster.get_client_count()
     }
 }
 
@@ -396,6 +560,7 @@ impl SignalOutput {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🎯 Starting Order-Book Imbalance Strategy...");
     println!("🌐 Remote streaming server: {}:{}", STREAMING_SOURCE_IP, STREAMING_SOURCE_PORT);
+    println!("📡 Signal UDP output: {}:{}", SIGNAL_OUTPUT_BIND_IP, SIGNAL_OUTPUT_PORT);
     
     // Configuration
     let strategy_config = StrategyConfig::default();
@@ -406,9 +571,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create consumer with hardcoded configuration
     let mut consumer = UdpMarketDataConsumer::new_with_hardcoded_config(strategy)?;
     
-    // Start signal output stream in background thread
-    let signal_output = SignalOutput::new(signal_receiver);
-    signal_output.start_output_stream();
+    // Start signal output stream with UDP broadcasting in background thread
+    let signal_output = SignalOutput::new(signal_receiver)?;
+    signal_output.start_output_stream()?;
     
     // Subscribe to some cryptocurrencies (like the Python example)
     let symbols = ["BTC", "ETH", "ADA", "SOL"];
@@ -419,8 +584,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("✅ Strategy initialized successfully!");
     println!("📡 Listening for data from {} symbols...", symbols.len());
-    println!("📊 Outputting buy/sell signals to stdout...");
+    println!("🎯 Broadcasting buy/sell signals via UDP on port {}", SIGNAL_OUTPUT_PORT);
+    println!("📞 UDP clients can connect by sending any message to {}:{}", SIGNAL_OUTPUT_BIND_IP, SIGNAL_OUTPUT_PORT);
     println!("Press Ctrl+C to stop");
+    
+    // Print client count periodically
+    let client_count_monitor = signal_output.udp_broadcaster.clients.clone();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            if let Ok(clients) = client_count_monitor.lock() {
+                let count = clients.len();
+                if count > 0 {
+                    println!("👥 Connected UDP clients: {}", count);
+                }
+            }
+        }
+    });
     
     // Set up Ctrl+C handler
     let consumer = Arc::new(Mutex::new(consumer));
