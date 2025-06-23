@@ -1,40 +1,53 @@
 use std::collections::HashMap;
-use std::net::UdpSocket;
+use std::net::{UdpSocket, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
+// ============================================
+// HARDCODED STREAMING SOURCE CONFIGURATION
+// ============================================
+const STREAMING_SOURCE_IP: &str = "34.127.57.0";   // GCP streaming service IP
+const STREAMING_SOURCE_PORT: u16 = 8888;           // GCP streaming service port
+
 // Configuration for the trading strategy
 #[derive(Clone, Debug)]
 pub struct StrategyConfig {
-    pub imbalance_threshold: f64,      // Minimum imbalance ratio to trigger signal
-    pub min_volume_threshold: f64,     // Minimum total volume to consider
-    pub lookback_periods: usize,       // Number of periods for moving average
-    pub signal_cooldown_ms: u64,       // Minimum time between signals
+    pub imbalance_threshold: f64,
+    pub min_volume_threshold: f64,
+    pub lookback_periods: usize,
+    pub signal_cooldown_ms: u64,
 }
 
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
-            imbalance_threshold: 0.6,      // 60% imbalance
+            imbalance_threshold: 0.6,
             min_volume_threshold: 10.0,
             lookback_periods: 5,
-            signal_cooldown_ms: 100,      // 1 second cooldown
+            signal_cooldown_ms: 100,
         }
     }
 }
 
-// Market data structure from UDP feed
+// Subscription request structure (matches Python client)
+#[derive(Debug, Serialize)]
+pub struct SubscriptionRequest {
+    pub action: String,  // "start" or "stop"
+    pub symbol: String,
+}
+
+// Market data structure from UDP feed - UPDATED to match Python structure
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketData {
     pub symbol: String,
+    pub price: f64,
+    pub volume: f64,
+    pub bid: f64,
+    pub ask: f64,
     pub timestamp: u64,
-    pub bid_price: f64,
-    pub bid_volume: f64,
-    pub ask_price: f64,
-    pub ask_volume: f64,
-    pub mid_price: f64,
+    pub exchange: String,
 }
 
 // Trading signal output
@@ -62,22 +75,29 @@ struct ImbalanceMetrics {
     bid_volume: f64,
     ask_volume: f64,
     total_volume: f64,
-    imbalance_ratio: f64, // (bid_volume - ask_volume) / total_volume
+    imbalance_ratio: f64,
     timestamp: u64,
 }
 
 impl ImbalanceMetrics {
-    fn new(bid_volume: f64, ask_volume: f64, timestamp: u64) -> Self {
-        let total_volume = bid_volume + ask_volume;
-        let imbalance_ratio = if total_volume > 0.0 {
-            (bid_volume - ask_volume) / total_volume
+    fn new(bid: f64, ask: f64, volume: f64, timestamp: u64) -> Self {
+        // Use bid/ask prices and volume to estimate imbalance
+        let spread = ask - bid;
+        let mid_price = (bid + ask) / 2.0;
+        
+        // Simple imbalance calculation based on spread and volume
+        let total_volume = volume;
+        let imbalance_ratio = if spread > 0.0 {
+            // Wider spread might indicate more ask pressure (negative imbalance)
+            // This is a simplified calculation - you might want to adjust this logic
+            (bid - mid_price) / (spread / 2.0)
         } else {
             0.0
         };
 
         Self {
-            bid_volume,
-            ask_volume,
+            bid_volume: volume / 2.0,  // Simplified assumption
+            ask_volume: volume / 2.0,  // Simplified assumption
             total_volume,
             imbalance_ratio,
             timestamp,
@@ -109,12 +129,16 @@ impl OrderBookImbalanceStrategy {
 
     pub fn process_market_data(&mut self, data: MarketData) {
         let metrics = ImbalanceMetrics::new(
-            data.bid_volume,
-            data.ask_volume,
+            data.bid,
+            data.ask,
+            data.volume,
             data.timestamp,
         );
-        println!("Bid Volume: {}", data.bid_volume);
-        println!("Ask Volume: {}", data.bid_volume);
+        
+        // Debug output
+        println!("📊 {}: ${:.4} | Vol: {:.2} | Bid: ${:.4} | Ask: ${:.4}", 
+                 data.symbol, data.price, data.volume, data.bid, data.ask);
+        
         // Store metrics history
         let history = self.metrics_history
             .entry(data.symbol.clone())
@@ -137,45 +161,40 @@ impl OrderBookImbalanceStrategy {
     }
 
     fn evaluate_signal(&self, symbol: &str, data: &MarketData, current_metrics: &ImbalanceMetrics) -> Option<Signal> {
-        // Check minimum volume threshold
         if current_metrics.total_volume < self.config.min_volume_threshold {
             return None;
         }
 
-        // Get historical metrics for smoothing
         let history = self.metrics_history.get(symbol)?;
         if history.len() < 2 {
             return None;
         }
 
-        // Calculate moving average of imbalance ratio
         let avg_imbalance = history.iter()
             .map(|m| m.imbalance_ratio)
             .sum::<f64>() / history.len() as f64;
 
-        // Calculate confidence based on consistency and magnitude
         let imbalance_consistency = self.calculate_consistency(history);
         let magnitude_factor = current_metrics.imbalance_ratio.abs();
         let confidence = (imbalance_consistency * magnitude_factor).min(1.0);
 
-        // Generate signals based on imbalance direction and threshold
+        let mid_price = (data.bid + data.ask) / 2.0;
+
         if avg_imbalance > self.config.imbalance_threshold {
-            // Strong bid pressure - Buy signal
             Some(Signal::Buy {
                 symbol: symbol.to_string(),
                 timestamp: data.timestamp,
                 confidence,
                 imbalance_ratio: avg_imbalance,
-                mid_price: data.mid_price,
+                mid_price,
             })
         } else if avg_imbalance < -self.config.imbalance_threshold {
-            // Strong ask pressure - Sell signal
             Some(Signal::Sell {
                 symbol: symbol.to_string(),
                 timestamp: data.timestamp,
                 confidence,
                 imbalance_ratio: avg_imbalance,
-                mid_price: data.mid_price,
+                mid_price,
             })
         } else {
             None
@@ -190,7 +209,6 @@ impl OrderBookImbalanceStrategy {
         let ratios: Vec<f64> = history.iter().map(|m| m.imbalance_ratio).collect();
         let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
         
-        // Calculate coefficient of variation (lower is more consistent)
         let variance = ratios.iter()
             .map(|r| (r - mean).powi(2))
             .sum::<f64>() / ratios.len() as f64;
@@ -201,7 +219,6 @@ impl OrderBookImbalanceStrategy {
             return 0.0;
         }
         
-        // Return consistency factor (inverse of coefficient of variation)
         let cv = std_dev / mean.abs();
         (1.0 / (1.0 + cv)).min(1.0)
     }
@@ -215,72 +232,93 @@ impl OrderBookImbalanceStrategy {
     }
 }
 
-// UDP market data consumer
+// UPDATED: UDP client that subscribes to streaming service
 pub struct UdpMarketDataConsumer {
     socket: UdpSocket,
     strategy: Arc<Mutex<OrderBookImbalanceStrategy>>,
+    server_addr: SocketAddr,
+    subscribed_symbols: Vec<String>,
 }
 
 impl UdpMarketDataConsumer {
-    pub fn new(bind_addr: &str, strategy: OrderBookImbalanceStrategy) -> Result<Self, Box<dyn std::error::Error>> {
-        let socket = Self::bind_with_retry(bind_addr)?;
-        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    pub fn new_with_hardcoded_config(strategy: OrderBookImbalanceStrategy) -> Result<Self, Box<dyn std::error::Error>> {
+        // Create client socket (bind to any available port)
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        let local_addr = socket.local_addr()?;
+        
+        println!("✓ Client socket bound to: {}", local_addr);
+        
+        // Server address to connect to
+        let server_addr: SocketAddr = format!("{}:{}", STREAMING_SOURCE_IP, STREAMING_SOURCE_PORT).parse()?;
+        println!("✓ Streaming server address: {}", server_addr);
+        
+        socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
         
         Ok(Self {
             socket,
             strategy: Arc::new(Mutex::new(strategy)),
+            server_addr,
+            subscribed_symbols: Vec::new(),
         })
     }
 
-    fn bind_with_retry(preferred_addr: &str) -> Result<UdpSocket, Box<dyn std::error::Error>> {
-        // Try the preferred address first
-        match UdpSocket::bind(preferred_addr) {
-            Ok(socket) => {
-                println!("Successfully bound to: {}", preferred_addr);
-                return Ok(socket);
+    // Subscribe to a cryptocurrency symbol
+    pub fn subscribe(&mut self, symbol: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let request = SubscriptionRequest {
+            action: "start".to_string(),
+            symbol: symbol.to_uppercase(),
+        };
+        
+        let json_data = serde_json::to_string(&request)?;
+        
+        match self.socket.send_to(json_data.as_bytes(), &self.server_addr) {
+            Ok(_) => {
+                println!("✓ Subscribed to {}", symbol.to_uppercase());
+                if !self.subscribed_symbols.contains(&symbol.to_uppercase()) {
+                    self.subscribed_symbols.push(symbol.to_uppercase());
+                }
+                Ok(())
             }
             Err(e) => {
-                println!("Failed to bind to {}: {}", preferred_addr, e);
+                println!("❌ Failed to subscribe to {}: {}", symbol, e);
+                Err(Box::new(e))
             }
-        }
-
-        // If preferred address fails, try alternative ports
-        let base_ip = if preferred_addr.contains(':') {
-            preferred_addr.split(':').next().unwrap_or("127.0.0.1")
-        } else {
-            "127.0.0.1"
-        };
-
-        for port in 8081..8100 {
-            let addr = format!("{}:{}", base_ip, port);
-            match UdpSocket::bind(&addr) {
-                Ok(socket) => {
-                    println!("Successfully bound to alternative address: {}", addr);
-                    return Ok(socket);
-                }
-                Err(_) => continue,
-            }
-        }
-
-        // If all else fails, let the OS choose a port
-        let auto_addr = format!("{}:0", base_ip);
-        match UdpSocket::bind(&auto_addr) {
-            Ok(socket) => {
-                let local_addr = socket.local_addr()?;
-                println!("Successfully bound to OS-assigned address: {}", local_addr);
-                Ok(socket)
-            }
-            Err(e) => Err(Box::new(e)),
         }
     }
 
-    pub fn start_consuming(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut buffer = [0u8; 1024];
+    // Unsubscribe from a cryptocurrency symbol
+    pub fn unsubscribe(&mut self, symbol: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let request = SubscriptionRequest {
+            action: "stop".to_string(),
+            symbol: symbol.to_uppercase(),
+        };
+        
+        let json_data = serde_json::to_string(&request)?;
+        
+        match self.socket.send_to(json_data.as_bytes(), &self.server_addr) {
+            Ok(_) => {
+                println!("✓ Unsubscribed from {}", symbol.to_uppercase());
+                self.subscribed_symbols.retain(|s| s != &symbol.to_uppercase());
+                Ok(())
+            }
+            Err(e) => {
+                println!("❌ Failed to unsubscribe from {}: {}", symbol, e);
+                Err(Box::new(e))
+            }
+        }
+    }
+
+    pub fn start_consuming(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🚀 Starting UDP consumption loop...");
+        println!("📡 Listening for data from server: {}", self.server_addr);
+        
+        let mut buffer = [0u8; 4096];
         
         loop {
             match self.socket.recv_from(&mut buffer) {
-                Ok((size, _addr)) => {
+                Ok((size, addr)) => {
                     let data_str = String::from_utf8_lossy(&buffer[..size]);
+                    println!("📦 Received {} bytes from {}", size, addr);
                     
                     // Parse JSON market data
                     match serde_json::from_str::<MarketData>(&data_str) {
@@ -290,19 +328,33 @@ impl UdpMarketDataConsumer {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to parse market data: {}", e);
+                            println!("❌ Failed to parse market data: {}", e);
+                            println!("Raw data: {}", data_str);
                         }
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
                     // Timeout - continue loop
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("UDP receive error: {}", e);
+                    eprintln!("❌ UDP receive error: {}", e);
+                    thread::sleep(Duration::from_millis(100));
                 }
             }
         }
+    }
+
+    // Clean shutdown
+    pub fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🛑 Shutting down client...");
+        
+        // Unsubscribe from all symbols
+        for symbol in self.subscribed_symbols.clone() {
+            let _ = self.unsubscribe(&symbol);
+        }
+        
+        Ok(())
     }
 }
 
@@ -320,17 +372,17 @@ impl SignalOutput {
         thread::spawn({
             let receiver = self.receiver.clone();
             move || {
+                println!("📊 Signal output thread started");
                 loop {
                     match receiver.recv() {
                         Ok(signal) => {
-                            // Output signal as JSON to stdout
                             match serde_json::to_string(&signal) {
-                                Ok(json) => println!("{}", json),
-                                Err(e) => eprintln!("Failed to serialize signal: {}", e),
+                                Ok(json) => println!("🚨 SIGNAL: {}", json),
+                                Err(e) => eprintln!("❌ Failed to serialize signal: {}", e),
                             }
                         }
                         Err(_) => {
-                            // Channel closed
+                            println!("📊 Signal output thread: Channel closed");
                             break;
                         }
                     }
@@ -340,106 +392,52 @@ impl SignalOutput {
     }
 }
 
-// Main application with command line argument support
+// Main application
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    println!("🎯 Starting Order-Book Imbalance Strategy...");
+    println!("🌐 Remote streaming server: {}:{}", STREAMING_SOURCE_IP, STREAMING_SOURCE_PORT);
     
-    // Parse command line arguments
-    let bind_addr = if args.len() > 1 {
-        &args[1]
-    } else {
-        "127.0.0.1:8080" // Default address
-    };
-
     // Configuration
-    let config = StrategyConfig::default();
-
-    println!("Starting Order-Book Imbalance Strategy...");
+    let strategy_config = StrategyConfig::default();
     
     // Create strategy and signal receiver
-    let (strategy, signal_receiver) = OrderBookImbalanceStrategy::new(config);
+    let (strategy, signal_receiver) = OrderBookImbalanceStrategy::new(strategy_config);
     
-    // Create UDP consumer with automatic port selection
-    let consumer = UdpMarketDataConsumer::new(bind_addr, strategy)?;
+    // Create consumer with hardcoded configuration
+    let mut consumer = UdpMarketDataConsumer::new_with_hardcoded_config(strategy)?;
     
-    // Start signal output stream
+    // Start signal output stream in background thread
     let signal_output = SignalOutput::new(signal_receiver);
     signal_output.start_output_stream();
     
-    println!("Strategy initialized successfully!");
-    println!("Outputting buy/sell signals to stdout...");
-    println!("Send market data as JSON to the UDP endpoint.");
+    // Subscribe to some cryptocurrencies (like the Python example)
+    let symbols = ["BTC", "ETH", "ADA", "SOL"];
+    for symbol in &symbols {
+        consumer.subscribe(symbol)?;
+        thread::sleep(Duration::from_millis(100)); // Small delay between subscriptions
+    }
     
-    // Start consuming market data (blocking)
-    consumer.start_consuming()?;
-    println!("Started Consumption");
+    println!("✅ Strategy initialized successfully!");
+    println!("📡 Listening for data from {} symbols...", symbols.len());
+    println!("📊 Outputting buy/sell signals to stdout...");
+    println!("Press Ctrl+C to stop");
+    
+    // Set up Ctrl+C handler
+    let consumer = Arc::new(Mutex::new(consumer));
+    let consumer_clone = consumer.clone();
+    
+    ctrlc::set_handler(move || {
+        println!("\n👋 Received Ctrl+C, shutting down...");
+        if let Ok(mut consumer) = consumer_clone.lock() {
+            let _ = consumer.shutdown();
+        }
+        std::process::exit(0);
+    })?;
+    
+    // Start consuming market data (this blocks)
+    if let Ok(mut consumer) = consumer.lock() {
+        consumer.start_consuming()?;
+    }
     
     Ok(())
-}
-
-// Example market data generator for testing
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::UdpSocket;
-    use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn generate_test_market_data(symbol: &str, bid_vol: f64, ask_vol: f64) -> MarketData {
-        MarketData {
-            symbol: symbol.to_string(),
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            bid_price: 100.0,
-            bid_volume: bid_vol,
-            ask_price: 100.1,
-            ask_volume: ask_vol,
-            mid_price: 100.05,
-        }
-    }
-
-    #[test]
-    fn test_imbalance_calculation() {
-        let config = StrategyConfig::default();
-        let (mut strategy, _rx) = OrderBookImbalanceStrategy::new(config);
-
-        // Test strong bid imbalance (should generate buy signal)
-        let data = generate_test_market_data("BTCUSD", 8000.0, 2000.0);
-        strategy.process_market_data(data.clone());
-        
-        // Add more data to build history
-        for _ in 0..5 {
-            let data = generate_test_market_data("BTCUSD", 7500.0, 2500.0);
-            strategy.process_market_data(data);
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    // Example UDP data sender for testing
-    pub fn send_test_data(target_port: Option<u16>) -> Result<(), Box<dyn std::error::Error>> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        let port = target_port.unwrap_or(8080);
-        let target_addr = format!("127.0.0.1:{}", port);
-
-        println!("Sending test data to: {}", target_addr);
-
-        loop {
-            // Simulate varying imbalance conditions
-            let bid_vol = 5000.0 + (rand::random::<f64>() - 0.5) * 4000.0;
-            let ask_vol = 3000.0 + (rand::random::<f64>() - 0.5) * 2000.0;
-            
-            let data = generate_test_market_data("BTCUSD", bid_vol, ask_vol);
-            let json = serde_json::to_string(&data)?;
-            
-            match socket.send_to(json.as_bytes(), &target_addr) {
-                Ok(_) => println!("Sent: bid={:.0}, ask={:.0}, imbalance={:.2}", 
-                    bid_vol, ask_vol, (bid_vol - ask_vol) / (bid_vol + ask_vol)),
-                Err(e) => eprintln!("Failed to send data: {}", e),
-            }
-            
-            thread::sleep(Duration::from_millis(500));
-        }
-    }
 }
