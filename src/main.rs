@@ -4,12 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
-
-// ============================================
-// HARDCODED STREAMING SOURCE CONFIGURATION
-// ============================================
-const STREAMING_SOURCE_IP: &str = "34.127.57.0";   // GCP streaming service IP
-const STREAMING_SOURCE_PORT: u16 = 8888;           // GCP streaming service port
+use std::env;
 
 // ============================================
 // SIGNAL OUTPUT UDP CONFIGURATION
@@ -75,6 +70,7 @@ pub enum Signal {
         mid_price: f64,
     },
 }
+
 // Order book imbalance metrics
 #[derive(Debug, Clone)]
 struct ImbalanceMetrics {
@@ -247,7 +243,11 @@ pub struct UdpMarketDataConsumer {
 }
 
 impl UdpMarketDataConsumer {
-    pub fn new_with_hardcoded_config(strategy: OrderBookImbalanceStrategy) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new_with_config(
+        strategy: OrderBookImbalanceStrategy,
+        streaming_ip: &str,
+        streaming_port: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create client socket (bind to any available port)
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         let local_addr = socket.local_addr()?;
@@ -255,7 +255,7 @@ impl UdpMarketDataConsumer {
         println!("✓ Client socket bound to: {}", local_addr);
         
         // Server address to connect to
-        let server_addr: SocketAddr = format!("{}:{}", STREAMING_SOURCE_IP, STREAMING_SOURCE_PORT).parse()?;
+        let server_addr: SocketAddr = format!("{}:{}", streaming_ip, streaming_port).parse()?;
         println!("✓ Streaming server address: {}", server_addr);
         
         socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
@@ -556,10 +556,37 @@ impl SignalOutput {
     }
 }
 
+// Configuration structure to hold environment variables
+#[derive(Debug)]
+struct AppConfig {
+    streaming_source_ip: String,
+    streaming_source_port: u16,
+}
+
+impl AppConfig {
+    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let streaming_source_ip = env::var("STREAMING_SOURCE_IP")
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        
+        let streaming_source_port: u16 = env::var("STREAMING_SOURCE_PORT")
+            .unwrap_or_else(|_| "8888".to_string())
+            .parse()
+            .map_err(|e| format!("Invalid STREAMING_SOURCE_PORT: {}", e))?;
+        
+        Ok(Self {
+            streaming_source_ip,
+            streaming_source_port,
+        })
+    }
+}
+
 // Main application
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load configuration from environment variables
+    let config = AppConfig::from_env()?;
+    
     println!("🎯 Starting Order-Book Imbalance Strategy...");
-    println!("🌐 Remote streaming server: {}:{}", STREAMING_SOURCE_IP, STREAMING_SOURCE_PORT);
+    println!("🌐 Remote streaming server: {}:{}", config.streaming_source_ip, config.streaming_source_port);
     println!("📡 Signal UDP output: {}:{}", SIGNAL_OUTPUT_BIND_IP, SIGNAL_OUTPUT_PORT);
     
     // Configuration
@@ -568,8 +595,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create strategy and signal receiver
     let (strategy, signal_receiver) = OrderBookImbalanceStrategy::new(strategy_config);
     
-    // Create consumer with hardcoded configuration
-    let mut consumer = UdpMarketDataConsumer::new_with_hardcoded_config(strategy)?;
+    // Create consumer with configuration from environment
+    let mut consumer = UdpMarketDataConsumer::new_with_config(
+        strategy, 
+        &config.streaming_source_ip, 
+        config.streaming_source_port
+    )?;
     
     // Start signal output stream with UDP broadcasting in background thread
     let signal_output = SignalOutput::new(signal_receiver)?;
