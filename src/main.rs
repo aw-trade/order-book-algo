@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{UdpSocket, SocketAddr};
+use std::net::{UdpSocket, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -255,7 +255,11 @@ impl UdpMarketDataConsumer {
         println!("✓ Client socket bound to: {}", local_addr);
         
         // Server address to connect to
-        let server_addr: SocketAddr = format!("{}:{}", streaming_ip, streaming_port).parse()?;
+
+        //let server_addr: SocketAddr = format!("{}:{}", streaming_ip, streaming_port).parse()?; // before k8s
+        let mut server_addrs = format!("{}:{}", streaming_ip, streaming_port).to_socket_addrs()?;
+        let server_addr = server_addrs.next().ok_or("Failed to resolve server address")?;
+
         println!("✓ Streaming server address: {}", server_addr);
         
         socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
@@ -613,6 +617,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(100)); // Small delay between subscriptions
     }
     
+    println!("🔍 Environment variables:");
+    println!("  STREAMING_SOURCE_IP = {:?}", env::var("STREAMING_SOURCE_IP"));
+    println!("  STREAMING_SOURCE_PORT = {:?}", env::var("STREAMING_SOURCE_PORT"));
+
     println!("✅ Strategy initialized successfully!");
     println!("📡 Listening for data from {} symbols...", symbols.len());
     println!("🎯 Broadcasting buy/sell signals via UDP on port {}", SIGNAL_OUTPUT_PORT);
