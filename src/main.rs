@@ -32,6 +32,33 @@ impl Default for StrategyConfig {
     }
 }
 
+impl StrategyConfig {
+    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let imbalance_threshold = env::var("IMBALANCE_THRESHOLD")
+            .map(|s| s.parse::<f64>())
+            .unwrap_or(Ok(0.6))?;
+        
+        let min_volume_threshold = env::var("MIN_VOLUME_THRESHOLD")
+            .map(|s| s.parse::<f64>())
+            .unwrap_or(Ok(10.0))?;
+        
+        let lookback_periods = env::var("LOOKBACK_PERIODS")
+            .map(|s| s.parse::<usize>())
+            .unwrap_or(Ok(5))?;
+        
+        let signal_cooldown_ms = env::var("SIGNAL_COOLDOWN_MS")
+            .map(|s| s.parse::<u64>())
+            .unwrap_or(Ok(100))?;
+        
+        Ok(Self {
+            imbalance_threshold,
+            min_volume_threshold,
+            lookback_periods,
+            signal_cooldown_ms,
+        })
+    }
+}
+
 // Subscription request structure (matches Python client)
 #[derive(Debug, Serialize)]
 pub struct SubscriptionRequest {
@@ -594,10 +621,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📡 Signal UDP output: {}:{}", SIGNAL_OUTPUT_BIND_IP, SIGNAL_OUTPUT_PORT);
     
     // Configuration
-    let strategy_config = StrategyConfig::default();
+    let strategy_config = StrategyConfig::from_env()?;
     
     // Create strategy and signal receiver
-    let (strategy, signal_receiver) = OrderBookImbalanceStrategy::new(strategy_config);
+    let (strategy, signal_receiver) = OrderBookImbalanceStrategy::new(strategy_config.clone());
     
     // Create consumer with configuration from environment
     let mut consumer = UdpMarketDataConsumer::new_with_config(
@@ -620,6 +647,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔍 Environment variables:");
     println!("  STREAMING_SOURCE_IP = {:?}", env::var("STREAMING_SOURCE_IP"));
     println!("  STREAMING_SOURCE_PORT = {:?}", env::var("STREAMING_SOURCE_PORT"));
+    
+    println!("⚙️  Strategy configuration:");
+    println!("  IMBALANCE_THRESHOLD = {:?} (using: {:.2})", env::var("IMBALANCE_THRESHOLD"), strategy_config.imbalance_threshold);
+    println!("  MIN_VOLUME_THRESHOLD = {:?} (using: {:.2})", env::var("MIN_VOLUME_THRESHOLD"), strategy_config.min_volume_threshold);
+    println!("  LOOKBACK_PERIODS = {:?} (using: {})", env::var("LOOKBACK_PERIODS"), strategy_config.lookback_periods);
+    println!("  SIGNAL_COOLDOWN_MS = {:?} (using: {})", env::var("SIGNAL_COOLDOWN_MS"), strategy_config.signal_cooldown_ms);
 
     println!("✅ Strategy initialized successfully!");
     println!("📡 Listening for data from {} symbols...", symbols.len());
